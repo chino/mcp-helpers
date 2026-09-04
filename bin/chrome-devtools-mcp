@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+#
+# Launcher for the Chrome DevTools MCP server.
+#
+# Wraps `npx chrome-devtools-mcp`, pins the browser binary, applies the flags
+# needed to avoid being classified as an automated client, and tees stdio to
+# log files for debugging.
+#
+# Reference:
+#   https://github.com/ChromeDevTools/chrome-devtools-mcp/tree/main
+#   https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/tool-reference.md
+
+
+# -----------------------------------------------------------------------------
+# Browser selection
+# -----------------------------------------------------------------------------
+#
+# Passed to the server as -e/--executablePath. Export CHROME_PATH beforehand to
+# override any of the choices below without editing this file.
+
+# Snap package (default).
+CHROME_PATH="${CHROME_PATH:-/snap/bin/chromium}"
+
+# Windows native Chrome, via WSL interop.
+#CHROME_PATH="${CHROME_PATH:-/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe}"
+
+# Playwright's bundled Chrome for Testing. Currently appears broken.
+#CHROME_PATH="${CHROME_PATH:-$HOME/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome}"
+
+
+# -----------------------------------------------------------------------------
+# Avoiding automation detection
+# -----------------------------------------------------------------------------
+#
+# Three flags below exist purely to stop Cloudflare and similar services from
+# classifying this browser as a bot. Each is documented here because comments
+# cannot be placed between the backslash-continued lines of the run() command.
+#
+#   --chrome-arg=--disable-blink-features=AutomationControlled
+#       Suppresses the AutomationControlled Blink feature, which is what sets
+#       navigator.webdriver to true. Verified: navigator.webdriver === false.
+#
+#   --ignore-default-chrome-arg=--enable-automation
+#       Puppeteer adds --enable-automation to every launch as part of its
+#       default argument list, so it cannot be removed with --chrome-arg (that
+#       flag only appends). --ignore-default-chrome-arg maps to Puppeteer's
+#       ignoreDefaultArgs and is the only way to drop it.
+#
+#       Note: --chrome-arg=--excludeSwitches=enable-automation does NOT work.
+#       excludeSwitches is a ChromeDriver/Selenium capability, not a Chrome
+#       command-line switch; Chrome silently ignores it and --enable-automation
+#       survives on the command line.
+#
+#   --chrome-arg=--no-sandbox
+#       Required under WSL.
+#
+# Deliberately NOT set: a spoofed User-Agent.
+#
+#       --chrome-arg=--user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+#
+#       Chromium already reports a UA that real users send, so overriding it
+#       gains nothing and actively hurts. --user-agent rewrites only the UA
+#       string; it has no effect on Client Hints. The result was a browser
+#       claiming Chrome/131 while sec-ch-ua still announced Chromium 151, and
+#       Chrome additionally blanks the high-entropy hints whenever the UA is
+#       overridden. Measured, second visit, same binary:
+#
+#                                       without override        with override
+#         User-Agent                    Chrome/151.0.0.0        Chrome/131.0.0.0
+#         sec-ch-ua                     "Chromium";v="151"      "Chromium";v="151"   <- contradicts UA
+#         sec-ch-ua-full-version-list   "Chromium";v="151.0.7922.108"   (empty)
+#         sec-ch-ua-arch                "x86"                   ""
+#         sec-ch-ua-bitness             "64"                    ""
+#
+# Current state with the flags above, confirmed both in-page and on the wire:
+#
+#   navigator.userAgent           Mozilla/5.0 (X11; Ubuntu; Linux x86_64) ... Chrome/151.0.0.0
+#   navigator.webdriver           false
+#   userAgentData.brands          [{Chromium, 151}, {Not=A?Brand, 99}]
+#   userAgentData.fullVersionList [{Chromium, 151.0.7922.108}, ...]
+#   sec-ch-ua                     "Chromium";v="151", "Not=A?Brand";v="99"
+#   sec-ch-ua-full-version-list   "Chromium";v="151.0.7922.108", "Not=A?Brand";v="99.0.0.0"
+#   sec-ch-ua-arch / -bitness     "x86" / "64"
+#
+# Everything agrees: the UA major version matches sec-ch-ua, the full version
+# list matches the actual binary, and the high-entropy hints are populated
+# rather than blank. The browser is identifiable as Chromium rather than Google
+# Chrome, which is expected and harmless.
+#
+# What Cloudflare's JSD ("JavaScript detection") actually reads, measured by
+# instrumenting the page before the challenge script runs. Counts are property
+# accesses during a single challenge:
+#
+#   198  navigator.userAgent          by far the most-read property
+#    21  navigator.userAgentData      the Client Hints surface
+#    12  window.innerWidth / Height
+#     7  navigator.vendor
+#     6  screen.availWidth / window.outerWidth
+#     5  navigator.deviceMemory
+#     3  Date.getTimezoneOffset / window.devicePixelRatio
+#
+# It cross-checks userAgent against userAgentData, which is precisely the
+# consistency the removed --user-agent flag used to break. At this stage it
+# never touches navigator.webdriver, canvas.toDataURL, or webgl.getParameter.
+
+
+# -----------------------------------------------------------------------------
+# Recovering from a Cloudflare challenge loop
+# -----------------------------------------------------------------------------
+#
+# cf_clearance is bound to the browser fingerprint it was issued against.
+# Changing any fingerprint-affecting flag invalidates existing tokens, so a
+# previously working site can start looping on "Just a moment..." precisely
+# because the fingerprint was corrected. The stale cookie must be removed
+# before a valid one can be minted.
+#
+# Procedure:
+#
+#   1. Close the browser. Chrome holds the cookie database open and flushes it
+#      from memory on exit, so deletions made underneath a live browser are
+#      silently undone.
+#
+#   2. Run ~/bin/cf-cookie-reset <domain>
+#         -n     preview only
+#         --all  every domain in the profile
+#         -p     operate on a different profile directory
+#      It backs up the database before deleting and refuses to run while a
+#      browser holds the profile.
+#
+#   3. Issue any MCP tool call. The browser relaunches, Cloudflare re-runs its
+#      JSD check against the now-consistent fingerprint, and a fresh
+#      cf_clearance is issued.
+#
+# The cookie database lives at:
+#   ~/.cache/chrome-devtools-mcp/chrome-profile/Default/Cookies
+#
+# Note on what requires a reconnect: editing THIS script requires a /mcp
+# reconnect, because the MCP server process was started with the old argv and
+# restarting only the browser is not enough. Cookie changes require just the
+# browser to be closed.
+#
+# An isolation test established that only cf_clearance matters:
+#
+#   cf_clearance + cf_chl_rc_ni   blocked
+#   cf_chl_rc_ni only             pass      cf_chl_rc_ni is an effect, not a cause
+#   cf_clearance only             blocked
+#   neither                       pass
+#
+# The advertising and consent cookies on the same domain (FCCDCF, __gads,
+# __eoi, and similar) are irrelevant in both directions.
+#
+# --isolated=true is an alternative: it allocates a temporary user-data-dir per
+# session, so stale tokens can never accumulate. The cost is that nothing
+# persists between sessions, including logins and valid clearance tokens.
+
+
+# -----------------------------------------------------------------------------
+# Optional flags, not currently enabled
+# -----------------------------------------------------------------------------
+
+# Use a temporary user-data-dir for the life of the session. Without it the
+# server defaults to a persistent profile.
+# --isolated=true \
+
+# Suppress the visible browser window.
+# --headless \
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+#
+# stdin, stdout and stderr are teed to "$log.stdin", "$log.stdout" and
+# "$log.stderr" respectively. Tail these to debug the MCP conversation.
+
+log=/tmp/chrome-devtools-mcp.logs
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+
+tee -a "$log.stdin" |
+npx \
+	-y \
+	chrome-devtools-mcp \
+	-e "$CHROME_PATH" \
+	--no-performance-crux \
+	--no-usage-statistics \
+	--chrome-arg=--no-sandbox \
+	--chrome-arg=--disable-blink-features=AutomationControlled \
+	--ignore-default-chrome-arg=--enable-automation \
+	--chrome-arg=--window-size=1920,1080 \
+	"$@" \
+		> >(tee -a "$log.stdout") \
+		2> >(tee -a "$log.stderr")
+
+exit "${PIPESTATUS[1]}"

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+# Drop Cloudflare cookies for a domain from the chrome-devtools-mcp profile.
+#
+# Why this is needed: cf_clearance is bound to the browser fingerprint it was
+# issued to. Change anything fingerprint-affecting (--user-agent,
+# --disable-blink-features, the Chrome version, ...) and the old token no longer
+# matches, so Cloudflare re-challenges on every load instead of honouring it.
+# Deleting the cookie lets a fresh one get minted against the new fingerprint.
+#
+# Chrome must not be running: it holds the SQLite DB open and flushes cookies
+# from memory on exit, which silently undoes deletions made underneath it.
+
+set -euo pipefail
+
+PROFILE="${CHROME_PROFILE:-$HOME/.cache/chrome-devtools-mcp/chrome-profile}"
+BACKUPS="$HOME/.cache/cf-cookie-reset/backups"
+
+# cf_clearance, cf_chl_* and __cf_bm, __cflb, __cfruid. The ESCAPE clauses
+# matter: _ is a single-char wildcard in LIKE, so an unescaped cf_% would also
+# match cfXclearance. A broader %cf% would drag in FCCDCF, latcf, _pk_id.1.cf09.
+MATCH="(name LIKE 'cf\_%' ESCAPE '\' OR name LIKE '\_\_cf%' ESCAPE '\')"
+
+usage(){
+	cat <<USAGE
+usage: ${0##*/} [-n] [-f] [-p PROFILE] <domain>|--all
+
+  <domain>   substring matched against the cookie host_key, e.g. example.com
+  --all      every domain in the profile
+  -n         dry run: list what would be deleted, change nothing
+  -f         delete even if a browser looks like it is running
+  -p PROFILE profile dir (default: \$CHROME_PROFILE or the chrome-devtools-mcp one)
+
+Deletes: cf_clearance, cf_chl_*, __cf_bm, __cflb, __cfruid
+Backs up the cookie DB to $BACKUPS before touching it.
+USAGE
+}
+
+dry=0; force=0; domain=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-n|--dry-run) dry=1; shift ;;
+		-f|--force)   force=1; shift ;;
+		-p|--profile) PROFILE="$2"; shift 2 ;;
+		-h|--help)    usage; exit 0 ;;
+		--all)        domain="--all"; shift ;;
+		-*)           echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+		*)            domain="$1"; shift ;;
+	esac
+done
+
+[ -n "$domain" ] || { usage >&2; exit 2; }
+
+# host_key goes into SQL as a literal, so allow only hostname-ish characters
+if [ "$domain" != "--all" ] && ! [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+	echo "refusing suspicious domain: $domain" >&2
+	exit 2
+fi
+
+DB="$PROFILE/Default/Cookies"
+[ -f "$DB" ] || { echo "no cookie DB at $DB" >&2; exit 1; }
+
+# a browser holding this profile will undo our writes on exit
+running=""
+for p in /proc/[0-9]*; do
+	[ -r "$p/cmdline" ] || continue
+	if tr '\0' '\n' < "$p/cmdline" 2>/dev/null | grep -qxF -- "--user-data-dir=$PROFILE"; then
+		running="$running ${p#/proc/}"
+	fi
+done
+if [ -n "$running" ] && [ "$force" -eq 0 ] && [ "$dry" -eq 0 ]; then
+	echo "a browser is using $PROFILE (pids:$running)" >&2
+	echo "close it first, or pass -f to override" >&2
+	exit 1
+fi
+
+if [ "$domain" = "--all" ]; then
+	where="$MATCH"
+else
+	where="host_key LIKE '%$domain%' AND $MATCH"
+fi
+
+matches=$(sqlite3 "$DB" "SELECT host_key || '  ' || name FROM cookies WHERE $where ORDER BY host_key, name;")
+
+if [ -z "$matches" ]; then
+	echo "no Cloudflare cookies for ${domain#--} in $DB"
+	exit 0
+fi
+
+echo "$matches" | sed 's/^/  /'
+n=$(printf '%s\n' "$matches" | wc -l)
+
+if [ "$dry" -eq 1 ]; then
+	echo "-- dry run, $n cookie(s) left alone"
+	exit 0
+fi
+
+mkdir -p "$BACKUPS"
+backup="$BACKUPS/Cookies.$(date +%Y%m%d-%H%M%S)"
+cp "$DB" "$backup"
+
+sqlite3 "$DB" "DELETE FROM cookies WHERE $where;"
+
+echo "deleted $n cookie(s); backup: $backup"
